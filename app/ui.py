@@ -388,22 +388,217 @@ class Window(QMainWindow):
         return context
 
     def _format_ai_message_html(self, speaker, message):
-        """Build one safe, styled chat block. Kept separate so it is easy to test."""
-        palette={
+        import html
+        import re
+
+        text = str(message or "")
+
+        def escape(value):
+            return html.escape(str(value), quote=True)
+
+        # Speaker styling: You = blue, Astra AI = green.
+        speaker_styles = {
             "You": ("#3155D9", "#EEF4FF", "#172033"),
-            "Astra": ("#047857", "#F0FDF4", "#16352A"),
-            "Astra error": ("#B91C1C", "#FEF2F2", "#7F1D1D"),
-            "System": ("#64748B", "#F8FAFC", "#334155"),
+            "Astra AI": ("#047857", "#F0FDF4", "#16352A"),
         }
-        label_color, bg, text_color = palette.get(speaker, ("#6366F1", "#FFFFFF", "#1D1D1F"))
-        safe_message = html.escape(str(message)).replace("\n", "<br>")
-        safe_speaker = html.escape(str(speaker))
+        speaker_key = "Astra AI" if str(speaker).strip().lower() == "astra" else str(speaker)
+        accent, bubble_bg, bubble_text = speaker_styles.get(
+            speaker_key,
+            ("#64748B", "#F8FAFC", "#1E293B"),
+        )
+        display_speaker = "Astra AI" if str(speaker).strip().lower() == "astra" else str(speaker)
+
+        # Extract fenced code blocks first so their contents are not
+        # interpreted as Markdown.
+        code_blocks = []
+
+        def save_code(match):
+            language = (match.group(1) or "").strip()
+            code = match.group(2) or ""
+            token = f"@@CODEBLOCK{len(code_blocks)}@@"
+            code_blocks.append((language, code))
+            return token
+
+        text = re.sub(
+            r"```([^\n]*)\n([\s\S]*?)```",
+            save_code,
+            text
+        )
+
+        # Escape everything before applying controlled Markdown formatting.
+        text = escape(text)
+
+        # Headings
+        text = re.sub(
+            r"^######\s+(.+)$",
+            r"<h6>\1</h6>",
+            text,
+            flags=re.MULTILINE
+        )
+        text = re.sub(
+            r"^#####\s+(.+)$",
+            r"<h5>\1</h5>",
+            text,
+            flags=re.MULTILINE
+        )
+        text = re.sub(
+            r"^####\s+(.+)$",
+            r"<h4>\1</h4>",
+            text,
+            flags=re.MULTILINE
+        )
+        text = re.sub(
+            r"^###\s+(.+)$",
+            r"<h3>\1</h3>",
+            text,
+            flags=re.MULTILINE
+        )
+        text = re.sub(
+            r"^##\s+(.+)$",
+            r"<h2>\1</h2>",
+            text,
+            flags=re.MULTILINE
+        )
+        text = re.sub(
+            r"^#\s+(.+)$",
+            r"<h1>\1</h1>",
+            text,
+            flags=re.MULTILINE
+        )
+
+        # Horizontal rules
+        text = re.sub(
+            r"^\s*([-*_])(?:\s*\1){2,}\s*$",
+            "<hr>",
+            text,
+            flags=re.MULTILINE
+        )
+
+        # Blockquotes
+        text = re.sub(
+            r"^&gt;\s?(.+)$",
+            r"<blockquote>\1</blockquote>",
+            text,
+            flags=re.MULTILINE
+        )
+
+        # Bold + italic
+        text = re.sub(r"\*\*\*(.+?)\*\*\*", r"<strong><em>\1</em></strong>", text)
+        text = re.sub(r"___(.+?)___", r"<strong><em>\1</em></strong>", text)
+        text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+        text = re.sub(r"__(.+?)__", r"<strong>\1</strong>", text)
+        text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<em>\1</em>", text)
+        text = re.sub(r"(?<!_)_([^_\n]+?)_(?!_)", r"<em>\1</em>", text)
+
+        # Inline code
+        text = re.sub(
+            r"`([^`\n]+)`",
+            r"<code>\1</code>",
+            text
+        )
+
+        # Markdown links
+        text = re.sub(
+            r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+            r'<a href="\2" target="_blank" rel="noopener noreferrer">\1</a>',
+            text
+        )
+
+        # Plain URLs
+        text = re.sub(
+            r"(?<![\"'=])(https?://[^\s<]+)",
+            r'<a href="\1" target="_blank" rel="noopener noreferrer">\1</a>',
+            text
+        )
+
+        # Lists
+        lines = text.splitlines()
+        output = []
+        in_ul = False
+        in_ol = False
+
+        for line in lines:
+            ul_match = re.match(r"^\s*[-*+]\s+(.+)$", line)
+            ol_match = re.match(r"^\s*\d+\.\s+(.+)$", line)
+
+            if ul_match:
+                if in_ol:
+                    output.append("</ol>")
+                    in_ol = False
+                if not in_ul:
+                    output.append("<ul>")
+                    in_ul = True
+                output.append(f"<li>{ul_match.group(1)}</li>")
+                continue
+
+            if ol_match:
+                if in_ul:
+                    output.append("</ul>")
+                    in_ul = False
+                if not in_ol:
+                    output.append("<ol>")
+                    in_ol = True
+                output.append(f"<li>{ol_match.group(1)}</li>")
+                continue
+
+            if in_ul:
+                output.append("</ul>")
+                in_ul = False
+
+            if in_ol:
+                output.append("</ol>")
+                in_ol = False
+
+            if line.strip() == "":
+                output.append("")
+            elif re.match(r"^<h[1-6]>.*</h[1-6]>$", line):
+                output.append(line)
+            elif line == "<hr>":
+                output.append(line)
+            elif line.startswith("<blockquote>"):
+                output.append(line)
+            else:
+                output.append(f"<p>{line}</p>")
+
+        if in_ul:
+            output.append("</ul>")
+
+        if in_ol:
+            output.append("</ol>")
+
+        rendered = "\n".join(output)
+
+        # Restore fenced code blocks after all other Markdown processing.
+        for index, (language, code) in enumerate(code_blocks):
+            token = f"@@CODEBLOCK{index}@@"
+
+            language_html = (
+                f'<div style="color:#8b9a93;font-size:11px;margin-bottom:6px;">'
+                f'{escape(language)}</div>'
+                if language else ""
+            )
+
+            code_html = (
+                f'<pre style="margin:0; padding:12px; border-radius:10px; '
+                f'background:#0b1712; overflow-x:auto;">'
+                f'<code>{escape(code)}</code></pre>'
+            )
+
+            rendered = rendered.replace(
+                token,
+                f'<div style="margin:10px 0;">{language_html}{code_html}</div>'
+            )
+
+        # Only the visual presentation is speaker-aware. The original
+        # Markdown response remains unchanged in history.
         return (
-            f'<div style="margin:0 0 14px 0; padding:12px 14px; '
-            f'background:{bg}; border:1px solid #E4E7EC; border-radius:14px;">'
-            f'<div style="color:{label_color}; font-weight:800; margin-bottom:6px; '
-            f'letter-spacing:.2px;">{safe_speaker}</div>'
-            f'<div style="color:{text_color}; line-height:1.55;">{safe_message}</div>'
+            f'<div style="margin:4px 0 2px;">'
+            f'<div style="font-weight:700;font-size:12px;line-height:1.35;'
+            f'color:{accent};margin:0 0 4px 2px;">{escape(display_speaker)}</div>'
+            f'<div style="padding:9px 12px;border-radius:10px;'
+            f'background:{bubble_bg};color:{bubble_text};">'
+            f'{rendered}'
+            f'</div>'
             f'</div>'
         )
 
