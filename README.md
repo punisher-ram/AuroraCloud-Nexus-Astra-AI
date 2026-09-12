@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # AURORA CLOUD — NEXUS · Astra AI Edition
 
 This additive upgrade keeps the existing ERP modules, navigation, document workflows, payments, receipts, exports, backups and Groq integration intact while polishing the interface and extending Astra.
@@ -48,3 +49,7 @@ Expected result includes:
 - invoice PDF PASS
 - receipt PDF PASS
 - Groq chat mock PASS
+=======
+# Aurora-Cloud---Nexus-With-Astra-AI
+AURORA CLOUD — NEXUS is a modern desktop ERP built with Python, PySide6, and SQLite, featuring invoicing, quotations, inventory, payments, analytics, documents, and more — with Astra AI integrated for intelligent ERP assistance.  Tech: Python • PySide6 • SQLite • Groq By hash
+>>>>>>> a7dcf67dba81475783bc3c0facef7935e3ebcdc9
