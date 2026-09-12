@@ -1,0 +1,280 @@
+from __future__ import annotations
+from datetime import date
+import html
+import re
+import threading
+from pathlib import Path
+from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtWidgets import *
+from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+from .ai.serneia import SerneiaClient, SerneiaError
+from .services import BusinessService
+from .documents import DocumentEngine
+
+NAV = ["Dashboard", "Quotes", "Invoices", "Customers", "Items", "Payments", "Receipts", "Ledger", "Inventory", "Expenses", "Vendors", "Analytics", "Documents", "Settings", "Activity"]
+NAV_ICONS = {"Dashboard":"◈", "Quotes":"◫", "Invoices":"▣", "Customers":"◎", "Items":"◇", "Payments":"₹", "Receipts":"◰", "Ledger":"≡", "Inventory":"◌", "Expenses":"↗", "Vendors":"◉", "Analytics":"◒", "Documents":"▤", "Settings":"⚙", "Activity":"◷"}
+
+
+class ModelWorker(QObject):
+    finished = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, client):
+        super().__init__()
+        self.client = client
+
+    def run(self):
+        try:
+            self.finished.emit(self.client.list_models())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ChatWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, client, question, context, model):
+        super().__init__()
+        self.client = client
+        self.question = question
+        self.context = context
+        self.model = model
+
+    def run(self):
+        try:
+            self.finished.emit(self.client.ask(self.question, self.context, model=self.model))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class SerneiaSignals(QObject):
+    models_loaded = Signal(object)
+    models_failed = Signal(str)
+    chat_finished = Signal(str)
+    chat_failed = Signal(str)
+
+
+
+class Window(QMainWindow):
+    def __init__(self, service: BusinessService, engine: DocumentEngine, root: Path):
+        super().__init__(); self.s, self.e, self.root = service, engine, root; self.current_module="Dashboard"; self.ai_client=SerneiaClient(); self.ai_panel=None; self.ai_chat=None; self.ai_input=None; self.ai_model=None; self.ai_status=None; self._ai_history=[]; self._ai_open_module="Dashboard"; self._models_loading=False; self._chat_busy=False; self.ai_attachments=[]; self._model_thread=None; self._chat_thread=None; self.document_widgets={"Quotes":{}, "Invoices":{}}; self.document_lines={"Quotes":[], "Invoices":[]}; self._serneia_signals=SerneiaSignals()
+        self._serneia_signals.models_loaded.connect(self._models_loaded)
+        self._serneia_signals.models_failed.connect(self._models_failed)
+        self._serneia_signals.chat_finished.connect(self._chat_finished)
+        self._serneia_signals.chat_failed.connect(self._chat_failed)
+        self.setWindowTitle("AURORA CLOUD — NEXUS"); self.resize(1680,1050); self.setMinimumSize(1280,800)
+        self.setWindowIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
+        central=QWidget(); self.setCentralWidget(central); shell=QHBoxLayout(central); shell.setContentsMargins(0,0,0,0); shell.setSpacing(0)
+        side=QFrame(); side.setObjectName("sidebar"); side.setFixedWidth(260); sl=QVBoxLayout(side); sl.setContentsMargins(18,24,18,18); sl.setSpacing(2)
+        brand_card=QFrame(); brand_card.setObjectName("brand_card")
+        brand_layout=QHBoxLayout(brand_card); brand_layout.setContentsMargins(10,10,12,10); brand_layout.setSpacing(10)
+        mark=self.label("A","logo_mark"); brand_layout.addWidget(mark)
+        word=QVBoxLayout(); word.setSpacing(1)
+        word.addWidget(self.label("AURORA CLOUD","brand")); word.addWidget(self.label("NEXUS","subbrand")); word.addWidget(self.label("BUSINESS OPERATING SYSTEM","brand_tag")); word.addWidget(self.label("by hash","signature"))
+        brand_layout.addLayout(word); sl.addWidget(brand_card); sl.addSpacing(22)
+        self.stack=QStackedWidget(); self.buttons={}
+        for name in NAV:
+            b=QPushButton(f"{NAV_ICONS[name]}   {name}"); b.setObjectName("nav"); b.setCheckable(True); b.setCursor(Qt.PointingHandCursor); b.clicked.connect(lambda checked=False,n=name:self.go(n)); sl.addWidget(b); self.buttons[name]=b; self.stack.addWidget(self.make_page(name))
+        sl.addStretch(); sl.addWidget(self.label("DATA SAFETY","nav_caption")); backup=QPushButton("◌   Create backup"); backup.setObjectName("secondary"); backup.clicked.connect(self.backup); sl.addWidget(backup); sl.addSpacing(12); sl.addWidget(self.label("AURORA NEXUS  ·  by hash","signature"), alignment=Qt.AlignCenter)
+        self.shell=shell; shell.addWidget(side)
+        content=QFrame(); content.setObjectName("content_shell")
+        content_layout=QVBoxLayout(content); content_layout.setContentsMargins(0,0,0,0); content_layout.setSpacing(0)
+        topbar=QFrame(); topbar.setObjectName("app_topbar")
+        top_layout=QHBoxLayout(topbar); top_layout.setContentsMargins(24,16,24,14); top_layout.setSpacing(12)
+        self.header_module=self.label("Dashboard","topbar_module"); top_layout.addWidget(self.header_module)
+        top_layout.addWidget(self.label("/  AURORA CLOUD — NEXUS","topbar_path"))
+        top_layout.addStretch()
+        self.global_search=QLineEdit(); self.global_search.setObjectName("global_search"); self.global_search.setPlaceholderText("Search ERP  ·  Ctrl+K"); self.global_search.setClearButtonEnabled(True); self.global_search.setMaximumWidth(330); self.global_search.returnPressed.connect(self.global_search_action); top_layout.addWidget(self.global_search)
+        self.db_badge=self.label("●  LOCAL DATABASE","db_badge"); top_layout.addWidget(self.db_badge)
+        content_layout.addWidget(topbar)
+        content_layout.addWidget(self.stack,1)
+        shell.addWidget(content,1)
+        self.build_ai_panel(shell)
+        QShortcut(QKeySequence("Ctrl+K"), self, activated=self.focus_global_search)
+        QShortcut(QKeySequence("Ctrl+Shift+A"), self, activated=lambda:self.toggle_ai(self.current_module))
+        self.go("Dashboard")
+        self._remove_visual_shadows()
+
+    def build_ai_panel(self, shell):
+        panel = QFrame()
+        panel.setObjectName("astra_panel")
+        panel.setFixedWidth(390)
+        panel.hide()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        head_card=QFrame(); head_card.setObjectName("astra_head_card"); hl=QVBoxLayout(head_card); hl.setContentsMargins(14,12,14,12); hl.setSpacing(8)
+        head=QHBoxLayout(); title_box=QVBoxLayout(); title_box.setSpacing(1)
+        title=QLabel("✦  ASTRA AI"); title.setObjectName("ai_title"); title_box.addWidget(title)
+        self.ai_context_label=QLabel("Current module · Dashboard"); self.ai_context_label.setObjectName("ai_context"); title_box.addWidget(self.ai_context_label)
+        head.addLayout(title_box); head.addStretch()
+        self.ai_live_dot=QLabel("●  READY"); self.ai_live_dot.setObjectName("ai_ready"); head.addWidget(self.ai_live_dot)
+        close=QPushButton("×"); close.setObjectName("icon_btn"); close.setToolTip("Close Astra"); close.clicked.connect(lambda: panel.hide()); head.addWidget(close)
+        hl.addLayout(head)
+        self.ai_status=QLabel("Astra is ready"); self.ai_status.setObjectName("ai_status")
+        hl.addWidget(self.ai_status)
+        layout.addWidget(head_card)
+
+        model_card=QFrame(); model_card.setObjectName("ai_card"); ml=QVBoxLayout(model_card); ml.setContentsMargins(12,10,12,10); ml.setSpacing(8)
+        lab=QLabel("MODEL"); lab.setObjectName("section_caption"); ml.addWidget(lab)
+        mr=QHBoxLayout(); self.ai_model=QComboBox(); self.ai_model.setObjectName("ai_model_combo"); self.ai_model.setMinimumHeight(42); self.ai_model.setMaxVisibleItems(12); self.ai_model.setSizeAdjustPolicy(QComboBox.AdjustToContents); self.ai_model.setMinimumContentsLength(24); self.ai_model.setEditable(False); self.ai_model.setInsertPolicy(QComboBox.NoInsert)
+        view=self.ai_model.view(); view.setMinimumWidth(430); view.setMinimumHeight(330); view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded); view.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        mr.addWidget(self.ai_model,1); refresh_models=QPushButton("↻"); refresh_models.setObjectName("icon_btn"); refresh_models.setToolTip("Refresh Groq models"); refresh_models.clicked.connect(self.load_ai_models); mr.addWidget(refresh_models); ml.addLayout(mr)
+        layout.addWidget(model_card)
+
+        quick=QHBoxLayout(); quick.setSpacing(6)
+        for text,prompt in (("Overview","Give me a concise overview of this module."),("Outstanding","Show me what is currently outstanding."),("Latest","What is the latest relevant transaction?"),("Explain","Explain the selected record.")):
+            b=QPushButton(text); b.setObjectName("ai_chip"); b.clicked.connect(lambda _=False,p=prompt:self._ai_quick_prompt(p)); quick.addWidget(b)
+        layout.addLayout(quick)
+
+        self.ai_chat=QTextEdit(); self.ai_chat.setObjectName("ai_chat"); self.ai_chat.setReadOnly(True); self.ai_chat.setAcceptRichText(True); self.ai_chat.setPlaceholderText("Astra can read your ERP data, selected records and PDFs here."); layout.addWidget(self.ai_chat,1)
+
+        composer=QFrame(); composer.setObjectName("ai_composer"); cl=QVBoxLayout(composer); cl.setContentsMargins(10,10,10,10); cl.setSpacing(8)
+        self.ai_input=QLineEdit(); self.ai_input.setObjectName("ai_input"); self.ai_input.setPlaceholderText("Ask Astra about your business…"); self.ai_input.returnPressed.connect(self._submit_ai_message); cl.addWidget(self.ai_input)
+        cr=QHBoxLayout(); attach=QPushButton("Attach PDF"); attach.setObjectName("ai_subtle"); attach.clicked.connect(self.attach_ai_pdf); cr.addWidget(attach)
+        copy=QPushButton("Copy"); copy.setObjectName("ai_subtle"); copy.clicked.connect(self.copy_ai_chat); cr.addWidget(copy)
+        clear=QPushButton("Clear"); clear.setObjectName("ai_subtle"); clear.clicked.connect(self.clear_ai_chat); cr.addWidget(clear); cr.addStretch()
+        self.ai_send=QPushButton("Ask Astra  ↵"); self.ai_send.setObjectName("ai_send"); self.ai_send.setDefault(False); self.ai_send.setAutoDefault(False); self.ai_send.clicked.connect(self._submit_ai_message); cr.addWidget(self.ai_send); cl.addLayout(cr)
+        layout.addWidget(composer)
+
+        shell.addWidget(panel)
+        self.ai_panel=panel
+        self.ai_attachments=[]
+        self._populate_model_catalog(self.ai_client.FALLBACK_MODELS)
+
+    def _flatten_combo_popup(self, combo):
+        """Keep combo popups visually flat without OS-style drop shadows."""
+        try:
+            popup = combo.view().window()
+            popup.setWindowFlag(Qt.NoDropShadowWindowHint, True)
+        except Exception:
+            pass
+
+    def _populate_model_catalog(self, models):
+        current = self.ai_model.currentData() or self.ai_client.default_model
+        self.ai_model.blockSignals(True)
+        self.ai_model.clear()
+        for number, model_id in enumerate(models, 1):
+            self.ai_model.addItem(f"{number}  ·  {model_id}", model_id)
+        preferred = self.ai_model.findData(current)
+        if preferred < 0:
+            preferred = self.ai_model.findData(self.ai_client.default_model)
+        if preferred < 0 and self.ai_model.count():
+            preferred = 0
+        if preferred >= 0:
+            self.ai_model.setCurrentIndex(preferred)
+        self.ai_model.blockSignals(False)
+        self.ai_model.setEnabled(True)
+
+    def focus_global_search(self):
+        self.global_search.setFocus(); self.global_search.selectAll()
+
+    def global_search_action(self):
+        q=self.global_search.text().strip().lower()
+        if not q: return
+        exact={n.lower():n for n in NAV}
+        if q in exact:
+            self.go(exact[q]); self.global_search.clear(); return
+        checks=[("customer","Customers","SELECT id, company_name FROM customers WHERE archived=0 AND (company_name LIKE ? OR contact_person LIKE ?) ORDER BY company_name LIMIT 8"),("invoice","Invoices","SELECT id, number FROM documents WHERE kind='INVOICE' AND number LIKE ? ORDER BY id DESC LIMIT 8"),("quote","Quotes","SELECT id, number FROM documents WHERE kind='QUOTE' AND number LIKE ? ORDER BY id DESC LIMIT 8"),("item","Items","SELECT id, name FROM items WHERE archived=0 AND (name LIKE ? OR sku LIKE ?) ORDER BY name LIMIT 8"),("vendor","Vendors","SELECT id, name FROM vendors WHERE archived=0 AND (name LIKE ? OR contact_person LIKE ?) ORDER BY name LIMIT 8")]
+        results=[]
+        for _,module,sql in checks:
+            try:
+                params=(f"%{q}%",f"%{q}%") if sql.count("?")==2 else (f"%{q}%",)
+                rows=self.s.db.rows(sql,params)
+                for r in rows: results.append((module, f"{r[1]}", int(r[0])))
+            except Exception: pass
+        d=QDialog(self); d.setWindowTitle("AURORA Search"); d.setMinimumWidth(560); l=QVBoxLayout(d); l.setSpacing(10); l.addWidget(QLabel(f"Results for  ‘{self.global_search.text().strip()}’"));
+        if not results:
+            l.addWidget(QLabel("No matching ERP records found."))
+        else:
+            for module,label,record_id in results[:20]:
+                b=QPushButton(f"{module}   ·   {label}"); b.setObjectName("secondary"); b.clicked.connect(lambda _=False,m=module,i=record_id:self._open_search_result(d,m,i)); l.addWidget(b)
+        d.exec(); self.global_search.clear()
+
+    def _open_search_result(self,dialog,module,record_id):
+        self.go(module)
+        if module=="Customers": table=self.customer_table
+        elif module=="Items": table=self.item_table
+        elif module=="Quotes": table=self._doc_widgets("Quotes")["table"]
+        elif module=="Invoices": table=self._doc_widgets("Invoices")["table"]
+        elif module=="Vendors": table=self.vendor_table
+        else: table=None
+        if table is not None:
+            for row in range(table.rowCount()):
+                item=table.item(row,0)
+                if item and str(item.text())==str(record_id): table.selectRow(row); break
+        dialog.accept()
+
+    def _ai_quick_prompt(self,prompt):
+        self.ai_input.setText(prompt); self.ai_input.setFocus()
+
+    def copy_ai_chat(self):
+        QGuiApplication.clipboard().setText(self.ai_chat.toPlainText())
+        self.ai_status.setText("Astra chat copied to clipboard")
+
+    def clear_ai_chat(self):
+        self.ai_chat.clear(); self._ai_history.clear(); self.ai_attachments.clear(); self.ai_status.setText("Astra chat cleared")
+
+    def attach_ai_pdf(self):
+        if PdfReader is None:
+            self._append_ai_message("Astra error","PDF reader support is not installed.",error=True); return
+        path,_=QFileDialog.getOpenFileName(self,"Attach PDF to Astra","","PDF files (*.pdf)")
+        if not path: return
+        try:
+            text="\n".join((page.extract_text() or "") for page in PdfReader(path).pages[:12])[:22000]
+            self.ai_attachments.append({"name":Path(path).name,"path":path,"text":text})
+            self.ai_status.setText(f"PDF attached · {Path(path).name}")
+            self._append_ai_message("System",f"Attached PDF: {Path(path).name}")
+        except Exception as exc:
+            self._append_ai_message("Astra error",f"Could not read PDF: {exc}",error=True)
+
+    def load_ai_models(self):
+        """Use the exact working Hash&KeGPT threading pattern for Groq model discovery."""
+        if getattr(self, "_models_loading", False):
+            return
+        self._models_loading = True
+        self._populate_model_catalog(self.ai_client.FALLBACK_MODELS)
+        if self.ai_status:
+            self.ai_status.setText("Connecting to Groq…")
+
+        def run():
+            try:
+                models = self.ai_client.list_models()
+                self._serneia_signals.models_loaded.emit(models)
+            except Exception as exc:
+                self._serneia_signals.models_failed.emit(str(exc))
+            finally:
+                self._models_loading = False
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _models_loaded(self, models):
+        # Keep the dropdown populated even if Groq answers with an empty list.
+        if not models:
+            models = self.ai_client.FALLBACK_MODELS
+            status = "Using built-in Groq model catalogue"
+        else:
+            status = f"{len(models)} Groq models available"
+        self._populate_model_catalog(models)
+        if self.ai_status:
+            self.ai_status.setText(status)
+
+    def _models_failed(self, message):
+        self._populate_model_catalog(self.ai_client.FALLBACK_MODELS)
+        if self.ai_status:
+            self.ai_status.setText("Using Groq model catalogue")
+        self._append_ai_message("Astra", f"Model list: {message}", error=True)
+
+    def _update_ai_context_badge(self):
+        selected=self._selected_record_context(self.current_module)
+        if selected:
+            self.ai_context_label.setText(f"Current module · {self.current_module}  ·  selected record")
+        else:
+            self.ai_context_label.setText(f"Current module · {self.current_module}")
